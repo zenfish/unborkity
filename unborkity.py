@@ -1105,14 +1105,16 @@ def suggest_alternatives(binary: str) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    # Python 3.14+ colorizes argparse help/usage on a TTY by default. `-c`
-    # is opt-in for *our* diagnostic output, not for the static help text;
-    # opt out at parser construction so `unborkity -h -c` stays plain.
+    # Python 3.14+ colorizes argparse help/usage on a TTY by default. We
+    # gate it on the same `-c` opt-in our diagnostic output uses — peek
+    # at argv before parsing since argparse handles -h before our main
+    # body ever runs.
     parser_kwargs: dict = {
         "description": "diagnose & repair borked dylib refs in a macOS binary",
     }
     if sys.version_info >= (3, 14):
-        parser_kwargs["color"] = False
+        peek = argv if argv is not None else sys.argv[1:]
+        parser_kwargs["color"] = ("-c" in peek) or ("--color" in peek)
     ap = argparse.ArgumentParser(**parser_kwargs)
     ap.add_argument("binary", nargs="+", metavar="binary-file",
                     help="path(s) to executable(s) or dylib(s); shells expand globs like /usr/local/bin/*")
