@@ -21,9 +21,10 @@ unborkity.py /usr/local/bin/hackrf_info
 # apply repairs
 unborkity.py -w /usr/local/bin/hackrf_info
 
-# check homebrew bin en-masse
+# check homebrew bin en-masse (add -b for just flagging borked)
 unborkity.py -t /opt/homebrew/bin/*
-
+[...]
+summary: 2792 ok, 26 borked, 1435 skipped  (of 4253 examined)
 ```
 
 The tool
