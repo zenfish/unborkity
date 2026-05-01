@@ -250,7 +250,7 @@ def test_force_chmods_and_reverts(broken_bin: Path, stash_dir: Path,
     assert not os.access(broken_bin, os.W_OK), "test fixture refused to go read-only"
 
     rc = unborkity.main([
-        "-w", "-f", "--no-suggestions", str(broken_bin),
+        "-w", "-f", "--skip-suggestions", str(broken_bin),
     ])
     assert rc == 0, f"force-write surgery failed (rc={rc})"
 
@@ -290,10 +290,74 @@ def test_cli_dry_run_makes_no_changes(broken_bin: Path):
     before = broken_bin.read_bytes()
     script = Path(__file__).parent.parent / "unborkity.py"
     proc = subprocess.run(
-        [sys.executable, str(script), str(broken_bin), "--no-suggestions"],
+        [sys.executable, str(script), str(broken_bin), "--skip-suggestions"],
         capture_output=True, text=True,
     )
     assert proc.returncode == 0, proc.stderr
     assert "dry run" in proc.stdout, "tool forgot to announce 'just looking, don't worry'"
     assert broken_bin.read_bytes() == before, \
         "the surgeon went poking around when they were told just to consult"
+
+
+# ---------------------------------------------------------------------------
+# new-feature unit tests
+
+def test_ecosystem_classifier():
+    """The triage nurse must tell brew from conda from macports at a glance."""
+    cases = {
+        "/opt/homebrew/lib/libfoo.dylib":                     "brew-arm",
+        "/opt/homebrew/Cellar/grpc/1.73/lib/x.dylib":         "brew-arm",
+        "/usr/local/Cellar/openssl/3.0/lib/x.dylib":          "brew-x86",
+        "/usr/local/lib/libfoo.dylib":                        "brew-x86",
+        "/opt/local/lib/libfoo.dylib":                        "macports",
+        "/Users/zen/radioconda/lib/libabsl.dylib":            "conda",
+        "/Users/x/miniconda3/lib/libfoo.dylib":               "conda",
+        "/usr/lib/libSystem.B.dylib":                         "system",
+        "/Applications/Foo.app/Contents/Frameworks/X.dylib":  "apps",
+        "/var/tmp/whatever.dylib":                            "other",
+    }
+    for path, expected in cases.items():
+        got = unborkity._ecosystem(path)
+        assert got == expected, f"nurse called {path!r} a {got!r}, expected {expected!r}"
+
+
+def test_cli_no_backup_skips_bak(broken_bin: Path, stash_dir: Path,
+                                 monkeypatch):
+    """`-n` skips the .bak file. Surgeon goes commando, no insurance copy."""
+    monkeypatch.setattr(unborkity, "SEARCH_PATHS", [str(stash_dir)])
+    _force_walk_only(monkeypatch)
+
+    # purge any prior /tmp backup left by other tests so we can prove
+    # this run did not write one.
+    sys_bak = Path("/tmp") / (broken_bin.name + ".unborkity.bak")
+    if sys_bak.exists():
+        sys_bak.unlink()
+
+    rc = unborkity.main([
+        "-w", "-n", "--skip-suggestions", str(broken_bin),
+    ])
+    assert rc == 0
+    assert not sys_bak.exists(), \
+        "no-backup mode left a .bak in /tmp; commando promise broken"
+
+
+def test_cli_no_backup_requires_write(broken_bin: Path):
+    """`-n` without `-w` is a surgeon refusing the gown but no operation booked."""
+    script = Path(__file__).parent.parent / "unborkity.py"
+    proc = subprocess.run(
+        [sys.executable, str(script), "-n", str(broken_bin)],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode != 0
+    assert "only meaningful with --write" in proc.stderr
+
+
+def test_diagnose_deep_smoke(broken_bin: Path):
+    """`diagnose_deep` walks the dylib graph without exploding on the fixture."""
+    walk = unborkity.diagnose_deep(str(broken_bin))
+    paths = [p for p, _, _ in walk]
+    assert str(broken_bin) in paths or os.path.realpath(str(broken_bin)) in paths, \
+        "deep walk forgot to visit the patient itself"
+    # the fixture has unresolved @rpath/libgreet, so cascading walk stops there;
+    # whatever it reaches should not loop.
+    assert len(paths) == len(set(paths)), "deep walk visited same node twice (cycle bug)"

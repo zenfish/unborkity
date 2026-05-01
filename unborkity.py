@@ -136,14 +136,41 @@ def _next_body_part() -> tuple[str, int]:
     return _body_parts_pool.pop(), _body_parts_cycle
 
 
+def _ecosystem(path: str) -> str:
+    """Classify a path's package-manager ecosystem from prefix.
+
+    Loose substring heuristic — labels surface in the donor-found
+    line so users can spot cross-ecosystem grafts (brew patient,
+    conda donor) at a glance, and feed `--ecosystem-only` filtering.
+    """
+    real = os.path.realpath(path)
+    if real.startswith("/opt/homebrew/"):
+        return "brew-arm"
+    if real.startswith(("/usr/local/Cellar/", "/usr/local/opt/", "/usr/local/lib/")):
+        return "brew-x86"
+    if real.startswith("/opt/local/"):
+        return "macports"
+    if any(seg in real for seg in (
+        "/anaconda", "/miniconda", "/miniforge", "/radioconda",
+        "/mambaforge", "/conda3/", "/conda/",
+    )):
+        return "conda"
+    if real.startswith(("/usr/lib/", "/System/", "/Library/Apple/")):
+        return "system"
+    if real.startswith("/Applications/"):
+        return "apps"
+    return "other"
+
+
 def _donor_found_msg(part: str, cycle: int, candidate: str) -> str:
+    tag = f" [{_ecosystem(candidate)}]"
     if cycle <= 1:
-        return f"BORKED -- donor's {part} found on disk: {candidate}"
+        return f"BORKED -- donor's {part} found on disk: {candidate}{tag}"
     if cycle == 2:
         return (f"BORKED -- Complications arose! "
-                f"Had to find another donor's {part} on the disk: {candidate}")
+                f"Had to find another donor's {part} on the disk: {candidate}{tag}")
     return (f"BORKED -- OMG. So many complications! "
-            f"Had to find yet another donor's {part} on the disk: {candidate}")
+            f"Had to find yet another donor's {part} on the disk: {candidate}{tag}")
 
 # Verb phrases for the "found N references; <phrase>:" header.
 DIAGNOSE_PHRASES = [
@@ -508,6 +535,14 @@ def get_rpaths(binary: str) -> list[str]:
 _FIND_CACHE: dict[str, str | None] = {}
 _HOT_DIRS: list[str] = []
 _HOT_DIRS_MAX = 16
+# `--ecosystem-only`: when set, diagnose() drops candidates whose ecosystem
+# differs from the patient's (e.g. brew binary, conda donor → ABI roulette).
+_ECO_ONLY: bool = False
+
+
+def _set_eco_only(b: bool) -> None:
+    global _ECO_ONLY
+    _ECO_ONLY = b
 # Cap basenames per mdfind invocation. Each clause adds ~30 chars + basename;
 # 50 stays comfortably under macOS ARG_MAX (~256 KB) even with very long names.
 _BULK_MDFIND_CHUNK = 50
@@ -713,15 +748,21 @@ def diagnose(binary: str, find_candidates: bool = True,
             else:
                 prewarm_find_lib(unresolved)
 
+    binary_eco = _ecosystem(binary)
     for i, raw, kind, resolved in prepared:
         tag = f"[{i:>2}/{n}]"
         candidate = None
+        rejected_donor: str | None = None
         if find_candidates and resolved is None and kind != "system":
             if progress:
                 with _Spinner(f"{tag} hunting donor for {os.path.basename(raw)}"):
                     candidate = find_lib(os.path.basename(raw))
             else:
                 candidate = find_lib(os.path.basename(raw))
+            # --ecosystem-only: drop cross-ecosystem donor (ABI roulette).
+            if candidate and _ECO_ONLY and _ecosystem(candidate) != binary_eco:
+                rejected_donor = candidate
+                candidate = None
         if progress:
             if kind == "system":
                 status = "system lib (untouchable)"
@@ -730,6 +771,11 @@ def diagnose(binary: str, find_candidates: bool = True,
             elif candidate:
                 part, cycle = _next_body_part()
                 status = _donor_found_msg(part, cycle, candidate)
+            elif rejected_donor:
+                part, _ = _next_body_part()
+                status = (f"BORKED -- donor {part} found at {rejected_donor} "
+                          f"[{_ecosystem(rejected_donor)}] but rejected: "
+                          f"ecosystem != patient's [{binary_eco}]")
             else:
                 part, _ = _next_body_part()
                 status = f"BORKED -- no donor {part} located"
@@ -750,6 +796,58 @@ def diagnose(binary: str, find_candidates: bool = True,
             candidate=candidate,
         ))
     return refs
+
+
+def diagnose_deep(binary: str, max_depth: int = 8
+                  ) -> list[tuple[str, int, list[LibRef]]]:
+    """BFS the dylib graph from `binary`, diagnosing each node.
+
+    Returns a list of (path, depth, refs) tuples in visit order. Skips
+    system libs (in shared cache, untouchable). Cycle-safe via realpath
+    seen-set. find_candidates=False at every node — deep mode is for
+    surveying the cascade, not planning per-dep grafts.
+    """
+    out: list[tuple[str, int, list[LibRef]]] = []
+    seen: set[str] = set()
+    queue: list[tuple[str, int]] = [(binary, 0)]
+    while queue:
+        path, depth = queue.pop(0)
+        real = os.path.realpath(path)
+        if real in seen or depth > max_depth:
+            continue
+        seen.add(real)
+        try:
+            refs = diagnose(real, find_candidates=False, progress=False)
+        except (UnborkityError, subprocess.CalledProcessError):
+            continue
+        out.append((real, depth, refs))
+        for r in refs:
+            if r.kind == "system" or not r.resolved:
+                continue
+            if os.path.realpath(r.resolved) not in seen:
+                queue.append((r.resolved, depth + 1))
+    return out
+
+
+def render_deep(walk: list[tuple[str, int, list[LibRef]]],
+                root: str) -> str:
+    """Tree-ish report for --deep: only show nodes with broken refs."""
+    lines: list[str] = ["", _c("--- deep report (transitive dylib graph) ---", _C_PHRASE)]
+    bad_nodes = [(p, d, refs) for p, d, refs in walk
+                 if any(r.is_broken for r in refs)]
+    if not bad_nodes:
+        n_clean = len(walk)
+        lines.append(f"  no cascading borks across {n_clean} reachable lib(s) — "
+                     f"clean all the way down")
+        return "\n".join(lines)
+    for path, depth, refs in bad_nodes:
+        broken = [r for r in refs if r.is_broken]
+        indent = "  " * (depth + 1)
+        marker = _c("BORKED", _C_BORKED) if path == root else _c("(dep)", _C_PHRASE)
+        lines.append(f"{indent}{marker} {path}  ({len(broken)} broken)")
+        for r in broken:
+            lines.append(f"{indent}  - {r.raw}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -817,15 +915,24 @@ def plan_fixes(binary: str, refs: list[LibRef]) -> list[FixOp]:
 # ---------------------------------------------------------------------------
 # application
 
-def apply_ops(binary: str, ops: list[FixOp], backup_dir: str = "/tmp") -> None:
-    """Backup, run install_name_tool, re-sign on arm64."""
+def apply_ops(binary: str, ops: list[FixOp], backup_dir: str = "/tmp",
+              make_backup: bool = True) -> None:
+    """Backup, run install_name_tool, re-sign on arm64.
+
+    `make_backup=False` skips the .bak copy. On failure we cannot restore,
+    so we re-raise with a clear note — caller opted out of the safety net.
+    """
     if not ops:
         log.info("no operations to apply — patient is in perfect health")
         return
 
-    backup = os.path.join(backup_dir, os.path.basename(binary) + ".unborkity.bak")
-    log.info("scrubbing in. backup of the patient -> %s", backup)
-    shutil.copy2(binary, backup)
+    backup: str | None = None
+    if make_backup:
+        backup = os.path.join(backup_dir, os.path.basename(binary) + ".unborkity.bak")
+        log.info("scrubbing in. backup of the patient -> %s", backup)
+        shutil.copy2(binary, backup)
+    else:
+        log.info("scrubbing in. -n set: no backup, no take-backsies")
     log.info("I'm a doctor, not a binary hacker. this might sting a bit...")
 
     for op in ops:
@@ -843,10 +950,15 @@ def apply_ops(binary: str, ops: list[FixOp], backup_dir: str = "/tmp") -> None:
         if proc.returncode != 0:
             log.error("the %s rejected! install_name_tool rc=%d: %s",
                       organ, proc.returncode, proc.stderr.strip())
-            log.error("reversing the procedure — restoring from backup")
-            shutil.copy2(backup, binary)
+            if backup is not None:
+                log.error("reversing the procedure — restoring from backup")
+                shutil.copy2(backup, binary)
+                raise UnborkityError(
+                    f"install_name_tool rejected the {op.op}: {proc.stderr.strip()}"
+                )
             raise UnborkityError(
-                f"install_name_tool rejected the {op.op}: {proc.stderr.strip()}"
+                f"install_name_tool rejected the {op.op}: {proc.stderr.strip()} "
+                f"(no backup taken; binary may be in a partially-modified state)"
             )
 
     if platform.machine() == "arm64":
@@ -993,7 +1105,15 @@ def suggest_alternatives(binary: str) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="diagnose & repair borked dylib refs in a macOS binary")
+    # Python 3.14+ colorizes argparse help/usage on a TTY by default. `-c`
+    # is opt-in for *our* diagnostic output, not for the static help text;
+    # opt out at parser construction so `unborkity -h -c` stays plain.
+    parser_kwargs: dict = {
+        "description": "diagnose & repair borked dylib refs in a macOS binary",
+    }
+    if sys.version_info >= (3, 14):
+        parser_kwargs["color"] = False
+    ap = argparse.ArgumentParser(**parser_kwargs)
     ap.add_argument("binary", nargs="+", metavar="binary-file",
                     help="path(s) to executable(s) or dylib(s); shells expand globs like /usr/local/bin/*")
     ap.add_argument("-t", "--test", action="store_true",
@@ -1011,11 +1131,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     ap.add_argument("-c", "--color", action="store_true",
                     help="colorize output (default: off; auto-suppressed if stdout is not a TTY)")
-    ap.add_argument("--no-suggestions", action="store_true",
+    ap.add_argument("-s", "--skip-suggestions", action="store_true",
                     help="skip the easier-fix suggestions")
+    ap.add_argument("-n", "--no-backup", action="store_true",
+                    help="with -w: skip the .bak file. faster, no take-backsies on failure")
+    ap.add_argument("-d", "--deep", action="store_true",
+                    help="after surface diagnose, walk the dylib graph and report "
+                         "cascading borks in transitively-loaded libs")
+    ap.add_argument("-e", "--ecosystem-only", action="store_true",
+                    help="reject donors from a different ecosystem than the patient "
+                         "(brew vs conda vs macports). avoids ABI roulette.")
     args = ap.parse_args(argv)
 
     _set_color(args.color and sys.stdout.isatty())
+    _set_eco_only(args.ecosystem_only)
 
     # Bail before anything else if otool / install_name_tool / codesign
     # aren't on PATH — every code path below assumes they exist.
@@ -1043,6 +1172,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.force and not args.write:
         ap.error("--force only meaningful with --write")
+
+    if args.no_backup and not args.write:
+        ap.error("--no-backup only meaningful with --write")
 
     if len(args.binary) > 1:
         ap.error("multiple binaries only supported with --test; "
@@ -1079,7 +1211,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.minimal_out:
         print(render_report(binary, refs, ops))
-        if not args.no_suggestions:
+        if args.deep:
+            walk = diagnose_deep(binary)
+            print(render_deep(walk, root=binary))
+        if not args.skip_suggestions:
             tips = suggest_alternatives(binary)
             if tips:
                 print()
@@ -1130,7 +1265,7 @@ def main(argv: list[str] | None = None) -> int:
                        new_env)
 
     try:
-        apply_ops(binary, ops)
+        apply_ops(binary, ops, make_backup=not args.no_backup)
     finally:
         if restore_mode is not None:
             try:
