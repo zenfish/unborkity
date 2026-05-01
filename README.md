@@ -9,8 +9,8 @@ Abort trap: 6
 
 I've had an old unpublished thing for years, thought I'd let claude-code beat it into shape for release. FWIW!
 
-When you get the above error, you can use otool to figure out the issue, then try to remember the syntax
-on how to fix it. This automates all that.
+When you get the above error (e.g. the executable is *borked*), you can use otool to figure out the issue, then try to
+remember the syntax on how to fix it. This automates all that.
 
 ## Usage
 
