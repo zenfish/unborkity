@@ -29,7 +29,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 log = logging.getLogger("unborkity")
 
@@ -462,7 +462,12 @@ def run_otool(binary: str) -> list[str]:
         ) from e
 
     refs: list[str] = []
-    for line in proc.stdout.splitlines()[1:]:  # first line echoes the file path
+    for line in proc.stdout.splitlines():
+        # Skip path-echo headers: single-arch ("<path>:") and the per-arch
+        # slice headers in fat/universal binaries ("<path> (architecture x):").
+        # All header forms have no leading whitespace and end with ':'.
+        if line and not line[0].isspace() and line.rstrip().endswith(":"):
+            continue
         m = OTOOL_LINE_RE.match(line)
         if not m:
             log.debug("skipping unparseable otool line: %r", line)
@@ -645,8 +650,17 @@ def resolve_ref(raw: str, binary: str, rpaths: list[str]) -> str | None:
         return cand if os.path.isfile(cand) else None
     if kind == "rpath":
         rel = raw[len("@rpath/"):]
+        # rpath entries can themselves contain @loader_path / @executable_path
+        # (very common: `@loader_path/../lib`). dyld expands these; we must too,
+        # else we false-positive borked on perfectly fine binaries.
+        bin_dir = os.path.dirname(binary)
         for rp in rpaths:
-            cand = os.path.normpath(os.path.join(rp, rel))
+            expanded = rp
+            if expanded.startswith("@loader_path"):
+                expanded = bin_dir + expanded[len("@loader_path"):]
+            elif expanded.startswith("@executable_path"):
+                expanded = bin_dir + expanded[len("@executable_path"):]
+            cand = os.path.normpath(os.path.join(expanded, rel))
             if os.path.isfile(cand):
                 return cand
         return None
@@ -872,68 +886,80 @@ def is_mach_o(path: str) -> bool:
     )
 
 
-def scan(binaries: Iterable[str]) -> list[ScanResult]:
-    """Triage a list of binaries — fast, no on-disk candidate hunting."""
-    results: list[ScanResult] = []
+def scan(binaries: Iterable[str]) -> Iterator[ScanResult]:
+    """Triage a list of binaries — fast, no on-disk candidate hunting.
+
+    Yields one ScanResult per binary as it's examined. Streaming so that
+    large lists (4k+ binaries on a Homebrew prefix) start producing output
+    immediately instead of waiting for the whole sweep to finish.
+    """
     for path in binaries:
         if not os.path.exists(path):
-            results.append(ScanResult(path, "skipped", [], "not found"))
+            yield ScanResult(path, "skipped", [], "not found")
             continue
         real = os.path.realpath(path)
         if not os.path.isfile(real):
-            results.append(ScanResult(path, "skipped", [], "not a regular file"))
+            yield ScanResult(path, "skipped", [], "not a regular file")
             continue
         if not is_mach_o(real):
-            results.append(ScanResult(path, "skipped", [], "not a Mach-O binary"))
+            yield ScanResult(path, "skipped", [], "not a Mach-O binary")
             continue
         try:
             refs = diagnose(real, find_candidates=False)
         except (subprocess.CalledProcessError, UnborkityError) as e:
-            results.append(ScanResult(path, "skipped", [], f"otool failed: {e}"))
+            yield ScanResult(path, "skipped", [], f"otool failed: {e}")
             continue
         broken = [r.raw for r in refs if r.is_broken]
-        results.append(ScanResult(
+        yield ScanResult(
             binary=path,
             status="borked" if broken else "ok",
             broken_refs=broken,
-        ))
-    return results
+        )
 
 
-def render_scan(results: list[ScanResult], color: bool = True,
-                borked_only: bool = False, minimal: bool = False) -> str:
-    """One line per binary: STATUS path [: broken refs].
+def render_scan(results: Iterable[ScanResult], color: bool = True,
+                borked_only: bool = False, minimal: bool = False) -> int:
+    """Stream one line per binary as it arrives: STATUS path [: broken refs].
+
+    Prints to stdout live (so a 4k-binary sweep starts producing output
+    immediately). Returns the number of borked binaries found.
 
     `minimal=True` drops the per-binary broken-ref list (status only).
     """
     def paint(s: str, code: str) -> str:
         return f"\033[{code}m{s}\033[0m" if color else s
 
-    lines: list[str] = []
+    n_borked = n_ok = n_skip = 0
     for r in results:
+        if r.status == "ok":
+            n_ok += 1
+        elif r.status == "borked":
+            n_borked += 1
+        else:
+            n_skip += 1
+
         if borked_only and r.status != "borked":
             continue
         if r.status == "ok":
             tag = paint("  ok  ", "32")
-            lines.append(f"{tag} {r.binary}")
+            print(f"{tag} {r.binary}", flush=True)
         elif r.status == "borked":
             tag = paint("BORKED", "31;1")
             if minimal:
-                lines.append(f"{tag} {r.binary}")
+                print(f"{tag} {r.binary}", flush=True)
             else:
                 refs = ", ".join(r.broken_refs)
-                lines.append(f"{tag} {r.binary}  ({len(r.broken_refs)} broken: {refs})")
+                print(f"{tag} {r.binary}  ({len(r.broken_refs)} broken: {refs})",
+                      flush=True)
         else:  # skipped
             tag = paint(" skip ", "33")
-            lines.append(f"{tag} {r.binary}  ({r.note})")
+            print(f"{tag} {r.binary}  ({r.note})", flush=True)
 
-    n_borked = sum(1 for r in results if r.status == "borked")
-    n_ok = sum(1 for r in results if r.status == "ok")
-    n_skip = sum(1 for r in results if r.status == "skipped")
-    lines.append("")
-    lines.append(f"summary: {n_ok} ok, {n_borked} borked, {n_skip} skipped"
-                 f"  (of {len(results)} examined)")
-    return "\n".join(lines)
+    n_total = n_ok + n_borked + n_skip
+    print()
+    print(f"summary: {n_ok} ok, {n_borked} borked, {n_skip} skipped"
+          f"  (of {n_total} examined)")
+    return n_borked
 
 
 def render_report(binary: str, refs: list[LibRef], ops: list[FixOp]) -> str:
@@ -1006,11 +1032,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.test:
         if args.write:
             ap.error("--test and --write are mutually exclusive")
-        results = scan(args.binary)
         color = args.color and sys.stdout.isatty()
-        print(render_scan(results, color=color, borked_only=args.borked,
-                          minimal=args.minimal_out))
-        return 1 if any(r.status == "borked" for r in results) else 0
+        n_borked = render_scan(scan(args.binary), color=color,
+                               borked_only=args.borked,
+                               minimal=args.minimal_out)
+        return 1 if n_borked else 0
 
     if args.borked:
         ap.error("--borked only meaningful with --test")

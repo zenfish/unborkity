@@ -140,12 +140,12 @@ def test_scan_classifies_broken_ok_skipped(broken_bin: Path, tmp_path: Path):
     sandwich = tmp_path / "notes.txt"
     sandwich.write_text("turkey on rye, no mayo")  # not a binary, nurse, please
 
-    results = unborkity.scan([
+    results = list(unborkity.scan([
         str(broken_bin),    # the patient — definitely borked
         "/bin/ls",          # the jogger — annoyingly healthy, came for a checkup
         str(sandwich),      # the sandwich — should not be in triage
         "/no/such/path",    # the no-show — never showed up to their appointment
-    ])
+    ]))
     by_status = {r.binary: r.status for r in results}
 
     assert by_status[str(broken_bin)] == "borked", "we missed the patient with the broken rib"
